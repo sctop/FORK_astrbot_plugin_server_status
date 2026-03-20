@@ -5,8 +5,70 @@ import platform
 import datetime
 import asyncio
 import os
+import sys
 from typing import Optional
 
+
+def check_if_looks_like_real_disk_partition(part: psutil._common.sdiskpart) -> bool:
+    """
+    Heuristic: try to exclude tmpfs, devtmpfs, proc, sysfs, fuse, overlay, etc.
+    This is far from perfect — especially on Windows/macOS.
+
+    (by Grok 4)
+    """
+    device = part.device.lower()
+    fstype = part.fstype.lower()
+    opts = part.opts.lower()
+
+    # Common virtual/pseudo filesystems to exclude
+    pseudo_fs = {
+        'tmpfs', 'devtmpfs', 'proc', 'sysfs', 'cgroup', 'cgroup2', 'pstore',
+        'debugfs', 'securityfs', 'efivarfs', 'configfs', 'fusectl', 'mqueue',
+        'overlay', 'squashfs', 'zfs', 'nfs', 'nfs4', 'cifs', 'smbfs', 'autofs',
+        'binfmt_misc', 'tracefs', 'bpf', 'hugetlbfs', 'ramfs'
+    }
+
+    if fstype in pseudo_fs:
+        return False
+
+    # Linux: often no fstype when special
+    if not fstype and any(x in device for x in ['/dev/pts', '/dev/shm', '/sys', '/proc']):
+        return False
+
+    # macOS common pseudo
+    if 'apfs' in fstype and any(x in part.mountpoint for x in [
+        '/System/Volumes', '/private/var', '/Library/Updates'
+    ]):
+        # APFS snapshots / recovery / VM volumes — often not "user data"
+        return False
+
+    # Windows: almost everything is NTFS/FAT/exFAT → can't filter much by fstype
+    # Rely mostly on !='cdrom' and not network/remote
+    if sys.platform == "win32":
+        if 'cdrom' in opts:
+            return False
+        if 'remote' in opts or 'network' in opts:
+            return False
+        return True  # most Windows drive letters are real-ish
+
+    # Linux: prefer things that start with /dev/ and not loop/ram/zram
+    if sys.platform.startswith("linux"):
+        if not device.startswith("/dev/"):
+            return False
+        if any(x in device for x in ["/dev/loop", "/dev/ram", "/dev/zram"]):
+            return False
+        return True
+
+    # macOS: usually /dev/diskXsY
+    if sys.platform == "darwin":
+        if not device.startswith("/dev/disk"):
+            return False
+        # Very rough: exclude /dev/disk0s (often internal recovery/system)
+        # But this is fragile — many users want them too
+        return True
+
+    # Fallback: include if it has a device and mountpoint
+    return bool(part.device and part.mountpoint)
 
 @register("服务器状态监控", "腾讯元宝&Meguminlove", "简单状态监控插件", "1.9.1",
           "https://github.com/Meguminlove/astrbot_plugin_server_status")
@@ -96,7 +158,8 @@ class ServerMonitor(Star):
         """获取所有磁盘分区的总使用情况"""
         total_size = 0
         used_size = 0
-        partitions = psutil.disk_partitions()
+        partitions_temp = psutil.disk_partitions(all=True)
+        partitions = [p for p in partitions_temp if check_if_looks_like_real_disk_partition(p)]
         for partition in partitions:
             # 某些分区类型（如CD-ROM）可能在未插入介质时引发错误
             # 使用 try-except 来跳过这些分区
